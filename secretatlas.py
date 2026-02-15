@@ -1,14 +1,17 @@
 """SecretAtlas — Cross-infrastructure secret inventory & lifecycle audit engine."""
-import re, json
+import re, json, hashlib, fnmatch
+
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
-
 @dataclass
 class Finding:
     name: str; source: str; path: str; line: int = 0
     severity: str = "medium"; stype: str = "generic"; hardcoded: bool = False
+    suppressed: bool = False; suppression_reason: str = ""
+    ts: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
     ts: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 PATTERNS = [
@@ -120,3 +123,135 @@ class SecretAtlas:
         rows.append(f"\n🔍 Total: {s['total']} | 🔴 Critical: {s['by_severity']['critical']} "
                      f"| 🟠 High: {s['by_severity']['high']} | ⚠️  Hardcoded: {s['hardcoded']}")
         return "\n".join(rows)
+
+
+class IgnoreManager:
+    """Manages .secretatlasignore rules and inline suppression comments."""
+
+    def __init__(self, ignore_file=None):
+        self.file_patterns: List[str] = []
+        self.dir_patterns: List[str] = []
+        self.type_patterns: List[str] = []
+        self.hash_patterns: set = set()
+        self._file_cache: dict = {}
+
+        if ignore_file:
+            p = Path(ignore_file)
+            if p.exists():
+                self._load(p)
+
+    def _load(self, path: Path):
+        for raw in path.read_text(errors='ignore').splitlines():
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            if line.startswith('type:'):
+                val = line[5:].strip()
+                if val:
+                    self.type_patterns.append(val)
+            elif line.startswith('hash:'):
+                val = line[5:].strip()
+                if val:
+                    self.hash_patterns.add(val)
+            elif line.endswith('/'):
+                dp = line.rstrip('/')
+                if dp:
+                    self.dir_patterns.append(dp)
+            else:
+                self.file_patterns.append(line)
+
+    @staticmethod
+    def compute_hash(finding: Finding) -> str:
+        canonical = f"{finding.path}:{finding.line}:{finding.name}:{finding.stype}"
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def should_skip_file(self, filepath: str) -> bool:
+        """Check if filepath matches any file glob or directory exclusion pattern."""
+        p = Path(filepath)
+        parts = p.parts
+        name = p.name
+
+        # Directory patterns: match any directory component (exclude filename)
+        for dp in self.dir_patterns:
+            for part in parts[:-1]:
+                if fnmatch.fnmatch(part, dp):
+                    return True
+
+        # File patterns: match against basename or full path
+        for fp in self.file_patterns:
+            if fnmatch.fnmatch(name, fp):
+                return True
+            if fnmatch.fnmatch(str(p), fp):
+                return True
+
+        return False
+
+    def _read_line(self, filepath: str, line_num: int) -> Optional[str]:
+        if filepath not in self._file_cache:
+            try:
+                self._file_cache[filepath] = Path(filepath).read_text(errors='ignore').splitlines()
+            except Exception:
+                self._file_cache[filepath] = []
+        lines = self._file_cache[filepath]
+        if 0 < line_num <= len(lines):
+            return lines[line_num - 1]
+        return None
+
+    @staticmethod
+    def _parse_inline(line_content: str):
+        """Parse inline suppression comment. Returns (suppressed: bool, reason: str|None)."""
+        patterns = [
+            r'#\s*secretatlas:ignore(?:\s+reason=(\S+))?',
+            r'//\s*secretatlas:ignore(?:\s+reason=(\S+))?',
+        ]
+        for pat in patterns:
+            m = re.search(pat, line_content)
+            if m:
+                reason = m.group(1) if m.group(1) else "inline-ignore"
+                return True, reason
+        return False, None
+
+    def check_inline_suppression(self, filepath: str, line_num: int):
+        """Check if a specific line has an inline suppression comment."""
+        line = self._read_line(filepath, line_num)
+        if line is not None:
+            return self._parse_inline(line)
+        return False, None
+
+    def process_findings(self, findings: List[Finding]) -> List[Finding]:
+        """Apply all suppression rules. Findings are never dropped, only marked."""
+        result = []
+        for f in findings:
+            # 1. File/directory pattern match
+            if self.should_skip_file(f.path):
+                f.suppressed = True
+                f.suppression_reason = "file-pattern-match"
+                result.append(f)
+                continue
+
+            # 2. Type-based suppression
+            if f.stype in self.type_patterns:
+                f.suppressed = True
+                f.suppression_reason = f"type-suppressed:{f.stype}"
+                result.append(f)
+                continue
+
+            # 3. Hash-based suppression (exact finding only)
+            fhash = self.compute_hash(f)
+            if fhash in self.hash_patterns:
+                f.suppressed = True
+                f.suppression_reason = f"hash-suppressed:{fhash}"
+                result.append(f)
+                continue
+
+            # 4. Inline suppression comment
+            suppressed, reason = self.check_inline_suppression(f.path, f.line)
+            if suppressed:
+                f.suppressed = True
+                f.suppression_reason = reason
+                result.append(f)
+                continue
+
+            result.append(f)
+
+        return result
